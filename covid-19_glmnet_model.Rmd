@@ -15,7 +15,6 @@ Here we use the rapid glmnet method to produce a classification model based the 
 ```{r Blank Slate}
 # blank slate, load required libraries and set working directory
 
-
 rm(list=ls())
 
 library(knitr)
@@ -115,8 +114,9 @@ cov_mean %>% select(-PATIENT_ID) %>% prcom_NA("outcome")
 
 
 ```{r analysis of missing values}
-# are the 57 samples with missing value very different from the rest ?
-# let's calculate the relative difference for each parameters between the data with and without missing values
+
+# Are the 57 samples with missing value very different from the rest ?
+# calculate the relative difference for each parameters between the data with and without missing values
 
 missing_cov_mean <- cov_mean %>% 
                     mutate(outcome = ifelse(outcome == "dead",1,0)) %>%
@@ -149,7 +149,6 @@ Since the samples are not fundamentally different, one can try to perform a knn 
 ```{r train and test samples preparation}
 
 # Split the data in training and testing sets (70/30 %) 
-
 set.seed(123)
 
 index = as.vector(createDataPartition(cov_mean$PATIENT_ID, p = 0.7, list = FALSE))
@@ -157,7 +156,6 @@ cov_train = cov_mean[index,] %>% as.data.frame()
 cov_test = cov_mean[-index,] %>% as.data.frame()
 
 # Optional: perform a -1 padding on the missing data. If this step is skipped, missing values will be assigned with knn Imputation for the glmnet model.
-
 
 cov_train <- cov_train %>% replace(is.na(.), -1)
 cov_test <- cov_test %>% replace(is.na(.), -1)
@@ -192,7 +190,7 @@ glmGrid = expand.grid(alpha = c(0,0.5,1),
 imp_pred = list()
 best_models = list()
 
-#RF is a stochastic algorithm, set.seed and run multiple times for reproducibility
+#run multiple times for reproducibility
 print(Sys.time())
 
 for (i in 1:20){
@@ -295,7 +293,7 @@ for (nfeature in 1:4){
   cov_train_select <- cov_train_select %>% mutate(ones = 1)
   class(cov_train_select)
 
-      for (i in 1:2){
+      for (i in 1:20){
         
         print(paste("iteration",i))
         print(Sys.time())
@@ -376,42 +374,6 @@ fancyRpartPlot(rpart_model$finalModel, sub = "rpart1SE")
 
 ```
 
-
-```{r validate (rtree_model)}
-
-# split1 = rtree_model$splits[1,4]
-# split2 = rtree_model$splits[2,4]
-# 
-# #predict and plot on all data
-# pred = predict(rtree_model, cov_mean[,best_param], type = "class")
-# pred_matrix = confusionMatrix(pred, cov_mean$outcome)
-# 
-# 
-# cov_mean[,best_param] %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
-#                     geom_point(aes(color = as.factor(pred==outcome), shape = as.factor(outcome)), alpha = 0.7)+
-#                     geom_rug(aes(color = as.factor(pred==outcome)), size = 1, alpha = 0.7)+
-#                     theme_classic()+
-#                     geom_hline(yintercept = split1, lty = 3, size = 0.5)+
-#                     geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
-#                     labs(color = "correct prediction")+
-#                     labs(shape = "outcome")+
-#                     annotate("text", x = 200, y = 1500, label = paste("Accuracy on test data =",as.character(round(pred_matrix$overall[1],2))))
-
-```
-
-```{r validate (rtree_model) 2}
-# cov_test_med[,best_param] %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
-#                     geom_point(aes(color = as.factor(outcome), shape = as.factor(pred)), alpha = 0.7)+
-#                     geom_rug(aes(color = as.factor(outcome)), size = 1, alpha = 0.7)+
-#                     theme_classic()+
-#                     geom_hline(yintercept = split1, lty = 3, size = 0.5)+
-#                     geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
-#                     labs(color = "outcome")+
-#                     labs(shape = "prediction")+
-#                     annotate("text", x = 200, y = 1500, label = paste("Accuracy on test data =",as.character(round(pred_matrix$overall[1],2))))
-```
-
-
 ```{r analysis of clinical evolution of the test 375 patients set}
 ## Select data by patient and by date (mean of the date collected each day if there are several measures)
 # Select the most influential parameters (best_param)
@@ -442,36 +404,7 @@ cov_data_lastday = cov_data_all %>% arrange(PATIENT_ID,RE_DATE) %>%
             labs(x = "hs-CRP (mg/L)", y = "LDH (U/L)", color = "outcome")
 ```
 The graph above displays the evolution the 2 best parameters for each patients, with the dot representing the last available value. Apart for 2 patients, if the values of Lactate dehydrogenase and hsCRP are below 342 U/L and 42 mg/L respectively, the outcome was favorable. This suggest that this model could be useful to predict the clinical outcome well before the death or discharge.
-
-
-```{r simple decision tree on the last days where the selected parameters are available (rtree_last_model) }
-
-# # select observations of last date available for each patient
-# cov_data_lastday
-# 
-# set.seed(123)
-# 
-# index = as.vector(createDataPartition(cov_data_lastday$PATIENT_ID, p = 0.7, list = FALSE))
-# cov_data_lastday_train = cov_data_lastday[index,] %>% as.data.frame()
-# cov_data_lastday_test = cov_data_lastday[-index,] %>% as.data.frame()
-# 
-# rtree_last_model <- rpart(outcome ~., cov_data_lastday_train[,best_param], method = "class", control=rpart.control(cp = 0.001, minsplit=20, xval = 100))
-# 
-# pred_date = predict(rtree_last_model, cov_data_lastday_test, type = "class" )
-# pred_matrix_test <- confusionMatrix(pred_date, cov_data_lastday_test$outcome)
-# pred_matrix_test
-# 
-# split1_last = rtree_last_model$splits[1,4]
-# split2_last = rtree_last_model$splits[2,4]
-# 
-# fancyRpartPlot(rtree_last_model, sub = paste("Accuracy on test data from last day =", round(pred_matrix_test$overall[1],2)))
-# 
-
-
-
-```
-
-
+  
 
 ```{r selecte all data with the selected parameters except the one corresponding to the last date}
 # exclude observations of the last date for each patient
@@ -561,7 +494,7 @@ The interpretable model can now be tested on an independent dataset from 110 pat
 
 #test on new set of data
 #load data, perform clean-up
-#propagate patient ID to all correcponding observations
+#propagate patient ID to all corresponding observations
 
 cov_new = read.csv("time_series_test_110_preprocess_en.csv",head= TRUE)
 cov_new$RE_DATE = as.Date(cov_new$RE_DATE)
@@ -594,7 +527,7 @@ pred_matrix_test
 
 print(paste("Accuracy on test data from other days:",pred_matrix_test$overall[1]))
 
-#inject prediction in the tibble
+#inject predictions in the tibble
 
 cov_new_all$pred = pred_date
 
@@ -615,9 +548,7 @@ cov_new_all %>%   filter(time_to_outcome >= 0) %>%
                   annotate("text", label = paste("average \n accuracy \n",round(pred_matrix_test$overall[1],4)), x = 32, y = pred_matrix_test$overall[1]*25)
                   
 ```
-The model predicts with an overall 91 % accuracy the clinical outcome.
-
-
+The model predicts with an overall 91 % accuracy the clinical outcome on an external data set.
 
 ```{r}
 cov_new_lastday = cov_new_all %>% arrange(PATIENT_ID,RE_DATE) %>% 
@@ -635,3 +566,5 @@ cov_new_lastday = cov_new_all %>% arrange(PATIENT_ID,RE_DATE) %>%
             
 ```
 
+The graph above displays the evolution the 2 best parameters for each patients, with the dot representing the last available value. On this new dataset, if the values of Lactate dehydrogenase and hsCRP are below 342 U/L and 42 mg/L respectively, the outcome was favorable. 
+  
