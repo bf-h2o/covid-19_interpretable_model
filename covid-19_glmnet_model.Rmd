@@ -1,0 +1,637 @@
+---
+title: "Covid-19 outcome prediction"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+This work is based on the data and Analysis of Li-Yan et al., 2019 published in Nature Machine Intelligence. 
+https://www.nature.com/articles/s42256-020-0180-7#MOESM3
+
+Blood analysis data from 485 patients infected by COVID-19 were collected, after the exclusion of pregnant women, brest-feeding woman, patient younger than 18 yo and patients for whom more than 20% of the data were missing. In the end,the data are divided in two sets: 375 individual in the first set (training set) and 110 in the second set (testing set). For each patient, up to 78 parameters were measured at several occasion between the admission and the release/death. 
+
+Here we use the rapid glmnet method to produce a classification model based the last datapoint available for each parameter. We reasonned that using the last data point would be more predictive of the outcome. 
+
+```{r Blank Slate}
+# blank slate, load required libraries and set working directory
+
+
+rm(list=ls())
+
+library(knitr)
+
+library(caret) # for hyperparameters tunning
+library(e1071) # dependency of caret
+library(RANN) # for knn imputation
+
+library(dplyr) 
+library(tidyr)
+library(ggfortify) # enable auto plotting
+library(rpart) # decision tree model
+library(rattle) # plotting decision tree
+library(glmnet) # glm model fitting
+
+
+
+setwd("~/Desktop")
+list.files()
+```
+
+
+The identification of the patient (PATIENT_ID) is only displayed for the first row of each patient. 
+```{r data loading}
+#load data, perform clean-up
+#propagate patient ID to all corresponding observations
+
+cov_data = read.csv("covid19_prerpocess_en.csv",head= TRUE)
+cov_data$RE_DATE = as.Date(cov_data$RE_DATE)
+cov_data$Admission.time = as.Date(cov_data$Admission.time)
+cov_data$Discharge.time = as.Date(cov_data$Discharge.time)
+
+#fill-in patient ID
+for (i in 1:length(cov_data$PATIENT_ID)) {
+  cov_data$PATIENT_ID[i] = ifelse(is.na(cov_data$PATIENT_ID[i]) == TRUE,
+                                  cov_data$PATIENT_ID[i - 1],
+                                  cov_data$PATIENT_ID[i])
+  
+}
+
+dim(cov_data) 
+length(unique(cov_data$PATIENT_ID)) # nombre de patients
+head(cov_data)
+
+```
+
+A maximum of 81 parameters were collected for 375 patients
+```{r data cleaning}
+# select the LAST (most recent) available value of each parameter for each patient. The date of analysis is eliminated since the last value of different variable may have been taken at different dates (not every parameters are measured every day).
+# eliminate parameters for which the value is unknown for more than 20% of patients
+# turn the outcome in dead/alive instead of 1/0
+# don't drop_na hare because NA might be contained in variables which have an influence later
+
+time_col = c("RE_DATE","Admission.time","Discharge.time")
+
+cov_mean <- cov_data %>%  group_by(PATIENT_ID) %>% 
+                          arrange(RE_DATE) %>%
+                          select(-time_col) %>%
+                          summarise_all( ~ nth(.,max(which(!is.na(.))))) %>% 
+                          select_if(funs(sum(is.na(.)) < 0.2 * length(unique(cov_data$PATIENT_ID))))  %>% 
+                          mutate(outcome = as.factor(ifelse(outcome == 1, "dead", "alive"))) 
+
+head(cov_mean)
+dim(cov_mean)
+
+```
+```{r PCA representation}
+
+# Perform a PCA on x, with the column y as outcome. 
+# Samples containing NA values are dropped (necessary to perform PCA)
+
+prcom_NA = function(x,y){
+  
+  library(ggfortify)
+  
+  plot_colors <-  x %>% 
+                  drop_na() %>%
+                  select(y) %>%
+                  unlist() %>%
+                  as.factor()
+
+  pr_plot =     x %>%  
+                select(-c(y)) %>% 
+                drop_na() %>% 
+                prcomp(scale = TRUE, center = TRUE) %>%
+                ggplot(aes(x = PC1, y =  PC2))+
+                geom_point(aes(color = plot_colors), alpha = 0.7)+
+                theme_classic()+
+                theme(legend.title = element_blank())
+  
+  print(pr_plot)
+
+} 
+
+cov_mean %>% select(-PATIENT_ID) %>% prcom_NA("outcome")
+```
+
+
+```{r analysis of missing values}
+# are the 57 samples with missing value very different from the rest ?
+# let's calculate the relative difference for each parameters between the data with and without missing values
+
+missing_cov_mean <- cov_mean %>% 
+                    mutate(outcome = ifelse(outcome == "dead",1,0)) %>%
+                    group_by(outcome) %>%
+                    filter_all(any_vars(is.na(.))) %>% 
+                    summarize_all(~ mean(., na.rm = TRUE))
+
+all_cov_mean <- cov_mean %>% 
+                    mutate(outcome = ifelse(outcome == "dead",1,0)) %>%
+                    group_by(outcome) %>%
+                    summarize_all(~ mean(., na.rm = TRUE))
+
+rel_diff <- abs(missing_cov_mean-all_cov_mean)/all_cov_mean %>% as.data.frame() 
+as_tibble(cbind(param = names(rel_diff[,-1]), (t(rel_diff[,-1])))) %>% mutate( dead_mean = as.numeric(V2), alive_mean = as.numeric(V3)) %>%
+  ggplot()+
+  geom_point(alpha = 0.5, aes(x = "dead",y = dead_mean))+
+  geom_point(alpha = 0.5, aes(x = "alive",y = alive_mean))+
+  ylab("relative difference NA/not NA")+
+  xlab("parameters")+
+  theme_classic()+
+  stat_summary(fun = "median", aes(y = dead_mean, x = 2), geom = "point", color = "red")+
+  stat_summary(fun = "median", aes(y = alive_mean, x = 1), geom = "point", color = "red")+
+  annotate("text", label = "median", x = 1.5, y = 0.044, color = "red")+
+  scale_y_log10(labels = scales::percent)+
+  coord_fixed(ratio=1, clip = "off")
+```
+As displayed on the graph, the majority of the differences is smaller than 10%.
+Since the samples are not fundamentally different, one can try to perform a knn or median input.
+
+```{r train and test samples preparation}
+
+# Split the data in training and testing sets (70/30 %) 
+
+set.seed(123)
+
+index = as.vector(createDataPartition(cov_mean$PATIENT_ID, p = 0.7, list = FALSE))
+cov_train = cov_mean[index,] %>% as.data.frame()
+cov_test = cov_mean[-index,] %>% as.data.frame()
+
+# Optional: perform a -1 padding on the missing data. If this step is skipped, missing values will be assigned with knn Imputation for the glmnet model.
+
+
+cov_train <- cov_train %>% replace(is.na(.), -1)
+cov_test <- cov_test %>% replace(is.na(.), -1)
+
+head(cov_train)
+
+
+```
+
+
+```{r glmnet fit}
+# the original paper uses extreme gradient boosting for the task, here a rapid glmnet approach is presented.
+# Alternatively random forest or xgbDART lead to similar results and can also be implemented in R.
+
+
+# glmnet model fit to identify the most influential parameters in the prediction of the outcome
+# 10 cross-validation with 5 repetitions
+# predict the class, not the probability
+# due to the difference of scale between parameters, the data are scaled and centered and the value of the missing data are imputed using knn if they have not been -1 padded before
+# since missing data are imputed, one can pass the NA values to the function (na.action = na.pass)
+
+
+fitControl = trainControl(method="repeatedcv", number=10, repeats = 5,
+                          summaryFunction = twoClassSummary,
+                          classProbs = TRUE,
+                          verboseIter = F)
+
+
+glmGrid = expand.grid(alpha = c(0,0.5,1),
+                      lambda = seq(0.0001,0.1,length = 10))
+
+imp_pred = list()
+best_models = list()
+
+#RF is a stochastic algorithm, set.seed and run multiple times for reproducibility
+print(Sys.time())
+
+for (i in 1:20){
+  
+  print(paste("iteration",i))
+  print(Sys.time())
+  set.seed(i)
+
+glmfit = train( outcome ~., 
+                data = cov_train[,-1],
+                method = "glmnet",
+                metric = "ROC",
+                trControl =fitControl,
+                tuneGrid = glmGrid,
+                preProcess = c("knnImpute","center","scale"),
+                standardize = TRUE,
+                na.action = na.pass
+                )
+  
+  imp_pred[[i]] = data.frame(var = rownames(varImp(glmfit)$importance), rel.inf = varImp(glmfit)$importance$Overall)
+  best_models[[i]] = cbind(glmfit$bestTune,max(glmfit$results$ROC))
+  
+  print(paste("max accuracy", max(glmfit$results$ROC)))
+
+}
+
+plot(glmfit)
+
+
+```
+
+Display and select the most influential parameters
+```{r display influential parameters}
+# save the best hyper-parameters
+best_a_l =  do.call(rbind, best_models) %>% 
+              summarise(alpha = median(alpha), lambda = median(lambda)) %>% 
+              unlist()
+
+head(best_a_l)
+
+print(best_models)
+
+# select the most influential factors
+plot_inf <- do.call(rbind, imp_pred) %>%  group_by(var) %>% 
+                              summarise(rel_inf = mean(rel.inf)) %>% 
+                              top_n(10) %>%
+                              ggplot(aes(x = reorder(var,rel_inf), y = rel_inf))+
+                              geom_col(fill = "#00BFC4", alpha = 0.2)+
+                              labs(y = "relative influence", x = "parameters", title = "glmnet")+
+                              coord_flip()+
+                              theme_classic()
+
+print(plot_inf)
+
+
+
+
+```
+```{r export images}
+# To export the graph of the relative influence of the predictors
+
+png(file = "glmnet.png", res = 300, width = 1024, height = 1024)
+plot_inf
+dev.off()
+
+```
+
+Perform predictions on the test data 
+```{r validate glmnet model on test data}
+
+# the model includes knn imputation, NA values can be passed to the function
+
+glmnet_pred = predict(glmfit, cov_test, na.action = na.pass)
+confusionMatrix(glmnet_pred, cov_test$outcome)
+
+```
+
+
+```{r features selection}
+
+
+# select the optimal number of parameters acceptable for the decision tree model.
+glmGrid = expand.grid(alpha = c(0,0.5,1),
+                      lambda = seq(0.0001,0.1,length = 10))
+
+
+top_10_param <- do.call(rbind, imp_pred) %>%  group_by(var) %>% 
+                              summarise(rel_inf = mean(rel.inf)) %>% 
+                              top_n(10) %>% arrange(-rel_inf)
+
+nfeature = 1
+best_depth = list()
+
+for (nfeature in 1:4){
+  
+  best_models_min =list()
+  
+  selected = c("outcome",top_10_param[1:nfeature,1]  %>% unlist() %>% as.character())
+  cov_train_select <- cov_train[,selected]
+  cov_train_select <- cov_train_select %>% mutate(ones = 1)
+  class(cov_train_select)
+
+      for (i in 1:2){
+        
+        print(paste("iteration",i))
+        print(Sys.time())
+        set.seed(i)
+      
+      glmfit_minimal = train( outcome ~., 
+                      data = cov_train_select,
+                      method = "glmnet",
+                      metric = "ROC",
+                      trControl =fitControl,
+                      tuneGrid = glmGrid,
+                      #preProcess = c("knnImpute","center","scale"),
+                      #standardize = TRUE,
+                      na.action = na.pass
+                      )
+        
+        best_models_min[[i]] = cbind(glmfit_minimal$bestTune,max(glmfit_minimal$results$ROC))
+        
+        print(paste("max ROC", max(glmfit_minimal$results$ROC)))
+      
+      }
+  
+  
+  best_depth[[nfeature]] = mean(do.call(rbind,best_models_min)[,3])
+
+
+}
+
+best_d <-   do.call(rbind, best_depth) %>% as_tibble()
+
+colnames(best_d) = "ROC"
+
+best_d %>%  ggplot(aes(x = 1:nfeature, y = ROC)) + 
+                geom_point() +
+                geom_line()+
+                theme_classic() +
+                labs(x = "number of parameters", y = "ROC")
+
+
+best_d <- best_d %>% mutate(improvement = ROC - lag(ROC))
+
+best_depth_val = which.max(best_d$improvement)
+
+
+```
+
+
+
+```{r simple decision tree on the most influential parameters (rtree_model)}
+
+#collect the same number of top parameters as the optimal interaction depth and the associated outcome
+
+
+best_param <- plot_inf$data %>% arrange(desc(rel_inf)) %>%
+              top_n(best_depth_val) %>%
+              select(var) %>%
+              unlist()%>%
+              as.character() %>%
+              append("outcome")
+
+rControl <- trainControl(method="cv", number=10, 
+                          summaryFunction = twoClassSummary,
+                          classProbs = TRUE,
+                          verboseIter = F)
+
+rpart_model <- train(outcome ~., 
+                cov_mean[,best_param],
+                method = "rpart1SE",
+                metric = "ROC",
+                trControl =rControl,
+                na.action = na.omit)
+
+split1 = rpart_model$finalModel$splits[1,4]
+split2 = rpart_model$finalModel$splits[2,4]
+
+fancyRpartPlot(rpart_model$finalModel, sub = "rpart1SE")
+
+
+```
+
+
+```{r validate (rtree_model)}
+
+# split1 = rtree_model$splits[1,4]
+# split2 = rtree_model$splits[2,4]
+# 
+# #predict and plot on all data
+# pred = predict(rtree_model, cov_mean[,best_param], type = "class")
+# pred_matrix = confusionMatrix(pred, cov_mean$outcome)
+# 
+# 
+# cov_mean[,best_param] %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
+#                     geom_point(aes(color = as.factor(pred==outcome), shape = as.factor(outcome)), alpha = 0.7)+
+#                     geom_rug(aes(color = as.factor(pred==outcome)), size = 1, alpha = 0.7)+
+#                     theme_classic()+
+#                     geom_hline(yintercept = split1, lty = 3, size = 0.5)+
+#                     geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
+#                     labs(color = "correct prediction")+
+#                     labs(shape = "outcome")+
+#                     annotate("text", x = 200, y = 1500, label = paste("Accuracy on test data =",as.character(round(pred_matrix$overall[1],2))))
+
+```
+
+```{r validate (rtree_model) 2}
+# cov_test_med[,best_param] %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
+#                     geom_point(aes(color = as.factor(outcome), shape = as.factor(pred)), alpha = 0.7)+
+#                     geom_rug(aes(color = as.factor(outcome)), size = 1, alpha = 0.7)+
+#                     theme_classic()+
+#                     geom_hline(yintercept = split1, lty = 3, size = 0.5)+
+#                     geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
+#                     labs(color = "outcome")+
+#                     labs(shape = "prediction")+
+#                     annotate("text", x = 200, y = 1500, label = paste("Accuracy on test data =",as.character(round(pred_matrix$overall[1],2))))
+```
+
+
+```{r analysis of clinical evolution of the test 375 patients set}
+## Select data by patient and by date (mean of the date collected each day if there are several measures)
+# Select the most influential parameters (best_param)
+# drop the row were the influential parameters are missing 
+cov_data_all <- cov_data  %>% 
+                group_by(PATIENT_ID, RE_DATE) %>% 
+                summarise_all( ~ mean(., na.rm = TRUE)) %>% 
+                select(c(RE_DATE,Discharge.time, best_param)) %>%
+                drop_na() %>%
+                mutate(outcome = (ifelse(outcome == 1, "dead", "alive")))  
+
+cov_data_all$outcome = as.factor(cov_data_all$outcome)
+
+
+# select observations of last date available for each patient
+# plot patient trajectories with dot representing the last measure
+cov_data_lastday = cov_data_all %>% arrange(PATIENT_ID,RE_DATE) %>% 
+                                    group_by(PATIENT_ID) %>%
+                                    filter(RE_DATE == max(RE_DATE))
+
+            ggplot(cov_data_all, aes_string(x = best_param[2], y = best_param[1], group = "PATIENT_ID"))+
+            geom_line(aes(color = as.factor(outcome)), alpha = 0.2)+
+            theme_classic()+
+            geom_hline(yintercept = split1, lty = 3, size = 0.5)+
+            geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
+            geom_point(data = cov_data_lastday, aes(color = as.factor(outcome)), alpha = 0.2)+
+              facet_wrap(~outcome, nrow = 2)+
+            labs(x = "hs-CRP (mg/L)", y = "LDH (U/L)", color = "outcome")
+```
+The graph above displays the evolution the 2 best parameters for each patients, with the dot representing the last available value. Apart for 2 patients, if the values of Lactate dehydrogenase and hsCRP are below 342 U/L and 42 mg/L respectively, the outcome was favorable. This suggest that this model could be useful to predict the clinical outcome well before the death or discharge.
+
+
+```{r simple decision tree on the last days where the selected parameters are available (rtree_last_model) }
+
+# # select observations of last date available for each patient
+# cov_data_lastday
+# 
+# set.seed(123)
+# 
+# index = as.vector(createDataPartition(cov_data_lastday$PATIENT_ID, p = 0.7, list = FALSE))
+# cov_data_lastday_train = cov_data_lastday[index,] %>% as.data.frame()
+# cov_data_lastday_test = cov_data_lastday[-index,] %>% as.data.frame()
+# 
+# rtree_last_model <- rpart(outcome ~., cov_data_lastday_train[,best_param], method = "class", control=rpart.control(cp = 0.001, minsplit=20, xval = 100))
+# 
+# pred_date = predict(rtree_last_model, cov_data_lastday_test, type = "class" )
+# pred_matrix_test <- confusionMatrix(pred_date, cov_data_lastday_test$outcome)
+# pred_matrix_test
+# 
+# split1_last = rtree_last_model$splits[1,4]
+# split2_last = rtree_last_model$splits[2,4]
+# 
+# fancyRpartPlot(rtree_last_model, sub = paste("Accuracy on test data from last day =", round(pred_matrix_test$overall[1],2)))
+# 
+
+
+
+```
+
+
+
+```{r selecte all data with the selected parameters except the one corresponding to the last date}
+# exclude observations of the last date for each patient
+cov_data_firstday = cov_data_all %>% anti_join(cov_data_lastday, by = c("PATIENT_ID" = "PATIENT_ID", "RE_DATE" = "RE_DATE"))
+
+
+pred_date = predict(rpart_model, cov_data_firstday, type = "raw" )
+pred_matrix_test <- confusionMatrix(pred_date, cov_data_firstday$outcome)
+pred_matrix_test
+
+print(paste("Accuracy on test data from other days:",pred_matrix_test$overall[1]))
+
+
+```
+
+```{r plot accuracy evolution}
+
+# Inject the prediction to the original table and plot the average accuracy of the prediction in function of the time to outcome.
+
+cov_data_firstday$pred = pred_date
+
+cov_data_firstday = cov_data_firstday %>% mutate(result = (outcome == pred))
+cov_data_firstday = cov_data_firstday %>% mutate(time_to_outcome = (Discharge.time - RE_DATE))
+
+# plot the accuracy of the model depending on how close to the actual outcome together with the number of observations
+cov_data_firstday %>% group_by(time_to_outcome) %>%
+                  summarize(val = mean(result), val_sd = sd(result), val_c = n()) %>%
+                  ggplot(aes(x = as.numeric(time_to_outcome), y = val_c))+
+                  geom_col(fill = "#00BFC4", alpha = 0.3)+
+                  geom_line(aes(y = val*25))+
+                  theme_classic()+
+                  scale_y_continuous("Number of observations", sec.axis = sec_axis(~ . * (1/25), name = "Accuracy ---", breaks = seq(0,1, by =0.2)))+
+                  xlab("days to outcome")+
+                  geom_hline(yintercept = pred_matrix_test$overall[1]*25, lty = 3)+
+                  annotate("text", label = "average \n accuracy", x = 34, y = pred_matrix_test$overall[1]*25)
+
+```
+Starting 2 weeks before the outcome, the accuracy of the predictions made on the data from the 375 patients dataset gradually increases. (Since the the last data acquired before the outcome were used for the training, they were excluded from the testing set presented here and there is therefor no data available for testing the prediction on the day of the outcome)
+
+```{r display prediction from (rtree_model)}
+cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
+                    geom_point(aes(color = as.factor(result), shape = as.factor(outcome)), alpha = 0.7)+
+                    geom_rug(aes(color = as.factor(result)), size = 0.2, alpha = 0.7)+
+                    theme_classic()+
+                    geom_hline(yintercept = split1, lty = 3, size = 0.5)+
+                    geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
+                    labs(color = "correct prediction")+
+                    labs(shape = "outcome")+
+                    annotate("text", x = 250, y = 1500, label = paste("Accuracy all data except \n last day =",as.character(round(pred_matrix_test$overall[1],2))))
+
+
+```
+The incorrect predictions (in red) appear to be scattered.
+
+```{r}
+cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
+                    geom_point(aes(color = as.factor(outcome), shape = as.factor(result)), alpha = 0.7)+
+                    geom_rug(aes(color = as.factor(outcome)), size = 0.2, alpha = 0.7)+
+                    theme_classic()+
+                    geom_hline(yintercept = split1, lty = 3, size = 0.5)+
+                    geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
+                    labs(color = "outcome")+
+                    labs(shape = "correct prediction")+
+                    annotate("text", x = 250, y = 1500, label = paste("Accuracy all data except \n last day =",as.character(round(pred_matrix_test$overall[1],2))))
+```
+
+
+```{r}
+# plotlyr
+
+#install.packages("plotly")
+library(plotly)
+
+fig3d <- plot_ly(data = cov_data_firstday, x = ~Lactate.dehydrogenase, y = ~Hypersensitive.c.reactive.protein, z = ~X...lymphocyte, color = ~outcome, colors = c('#F8776D', '#00BFC4'), opacity = 0.6, size = 0.3) 
+
+
+fig3d <- fig3d %>% add_markers()
+
+fig3d
+
+
+```
+
+The interpretable model can now be tested on an independent dataset from 110 patients for every available dates.
+
+```{r}
+
+#test on new set of data
+#load data, perform clean-up
+#propagate patient ID to all correcponding observations
+
+cov_new = read.csv("time_series_test_110_preprocess_en.csv",head= TRUE)
+cov_new$RE_DATE = as.Date(cov_new$RE_DATE)
+cov_new$Admission.time = as.Date(cov_new$Admission.time)
+cov_new$Discharge.time = as.Date(cov_new$Discharge.time)
+
+#fill-in patient ID
+for (i in 1:length(cov_new$PATIENT_ID)) {
+  cov_new$PATIENT_ID[i] = ifelse(is.na(cov_new$PATIENT_ID[i]) == TRUE,
+                                  cov_new$PATIENT_ID[i - 1],
+                                  cov_new$PATIENT_ID[i])
+  
+}
+
+dim(cov_new)
+length(unique(cov_new$PATIENT_ID))
+head(cov_new)
+
+cov_new_all =   cov_new  %>% 
+                group_by(PATIENT_ID, RE_DATE) %>% 
+                summarise_all( ~ mean(., na.rm = TRUE)) %>% 
+                drop_na() %>%
+                mutate(outcome = (ifelse(outcome == 1, "dead", "alive"))) 
+               
+cov_new_all$outcome =  as.factor(cov_new_all$outcome)
+
+pred_date = predict(rpart_model, cov_new_all, type = "raw" )
+pred_matrix_test <- confusionMatrix(pred_date, cov_new_all$outcome)
+pred_matrix_test
+
+print(paste("Accuracy on test data from other days:",pred_matrix_test$overall[1]))
+
+#inject prediction in the tibble
+
+cov_new_all$pred = pred_date
+
+cov_new_all = cov_new_all %>% mutate(result = (outcome == pred))
+cov_new_all = cov_new_all %>% mutate(time_to_outcome = (Discharge.time - RE_DATE))
+
+# plot the accuracy of the model depending on how close to the actual outcome together with the number of observations
+cov_new_all %>%   filter(time_to_outcome >= 0) %>%
+                  group_by(time_to_outcome) %>%
+                  summarize(val = mean(result), val_sd = sd(result), val_c = n()) %>%
+                  ggplot(aes(x = as.numeric(time_to_outcome), y = val_c))+
+                  geom_col(fill = "#00BFC4", alpha = 0.3)+
+                  geom_line(aes(y = val*25))+
+                  theme_classic()+
+                  scale_y_continuous("Number of observations", sec.axis = sec_axis(~ . * (1/25), name = "Accuracy ---", breaks = seq(0,1, by =0.2)))+
+                  xlab("days to outcome")+
+                  geom_hline(yintercept = pred_matrix_test$overall[1]*25, lty = 3)+
+                  annotate("text", label = paste("average \n accuracy \n",round(pred_matrix_test$overall[1],4)), x = 32, y = pred_matrix_test$overall[1]*25)
+                  
+```
+The model predicts with an overall 91 % accuracy the clinical outcome.
+
+
+
+```{r}
+cov_new_lastday = cov_new_all %>% arrange(PATIENT_ID,RE_DATE) %>% 
+                                    group_by(PATIENT_ID) %>%
+                                    filter(RE_DATE == max(RE_DATE))
+
+            ggplot(cov_new_all, aes_string(x = best_param[2], y = best_param[1], group = "PATIENT_ID"))+
+            geom_line(aes(color = as.factor(outcome)), alpha = 0.2)+
+            theme_classic()+
+            geom_hline(yintercept = split1, lty = 3, size = 0.5)+
+            geom_segment(y = 0, yend = split1, x = split2, xend = split2, lty = 3, size = 0.5)+
+            geom_point(data = cov_new_lastday, aes(color = as.factor(outcome)), alpha = 0.2)+
+            facet_wrap(~outcome, nrow = 2)+
+            labs(y = "LDH U/L", x = "hs-CRP mg/L",color = "outcome")
+            
+```
+
