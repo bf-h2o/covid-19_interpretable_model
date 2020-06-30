@@ -10,12 +10,14 @@ https://www.nature.com/articles/s42256-020-0180-7#MOESM3
 
 Blood analysis data from 485 patients infected by COVID-19 were collected, after the exclusion of pregnant women, brest-feeding woman, patient younger than 18 yo and patients for whom more than 20% of the data were missing. In the end,the data are divided in two sets: 375 individual in the first set (training set) and 110 in the second set (testing set). For each patient, up to 78 parameters were measured at several occasion between the admission and the release/death. 
 
-Here we use the rapid glmnet method to produce a classification model based the last datapoint available for each parameter. We reasonned that using the last data point would be more predictive of the outcome. 
+Here we use the rapid glmnet method to produce a classification model based the last data point available for each parameter. We reasoned that using the last data point would be more predictive of the outcome. 
+
+Based on the results of the glmnet model, 3 features selected to build an interpretable decision tree.
 
 ```{r Blank Slate}
 # blank slate, load required libraries and set working directory
 
-rm(list=ls())
+#rm(list=ls())
 
 library(knitr)
 
@@ -42,7 +44,8 @@ The identification of the patient (PATIENT_ID) is only displayed for the first r
 #load data, perform clean-up
 #propagate patient ID to all corresponding observations
 
-cov_data = read.csv("covid19_prerpocess_en.csv",head= TRUE)
+
+cov_data = read.csv("time_series_375_prerpocess_en.csv",head= TRUE)
 cov_data$RE_DATE = as.Date(cov_data$RE_DATE)
 cov_data$Admission.time = as.Date(cov_data$Admission.time)
 cov_data$Discharge.time = as.Date(cov_data$Discharge.time)
@@ -115,7 +118,15 @@ cov_mean %>% select(-PATIENT_ID) %>% prcom_NA("outcome")
 
 ```{r analysis of missing values}
 
-# Are the 57 samples with missing value very different from the rest ?
+library(naniar)
+miss_var_summary(cov_mean)
+miss_case_table(cov_mean)
+
+gg_miss_var(cov_mean)
+gg_miss_case(cov_mean)
+
+
+# Are the samples with missing value very different from the rest ?
 # calculate the relative difference for each parameters between the data with and without missing values
 
 missing_cov_mean <- cov_mean %>% 
@@ -129,7 +140,7 @@ all_cov_mean <- cov_mean %>%
                     group_by(outcome) %>%
                     summarize_all(~ mean(., na.rm = TRUE))
 
-rel_diff <- abs(missing_cov_mean-all_cov_mean)/all_cov_mean %>% as.data.frame() 
+rel_diff <- (missing_cov_mean-all_cov_mean)/all_cov_mean %>% as.data.frame() 
 as_tibble(cbind(param = names(rel_diff[,-1]), (t(rel_diff[,-1])))) %>% mutate( dead_mean = as.numeric(V2), alive_mean = as.numeric(V3)) %>%
   ggplot()+
   geom_point(alpha = 0.5, aes(x = "dead",y = dead_mean))+
@@ -140,7 +151,7 @@ as_tibble(cbind(param = names(rel_diff[,-1]), (t(rel_diff[,-1])))) %>% mutate( d
   stat_summary(fun = "median", aes(y = dead_mean, x = 2), geom = "point", color = "red")+
   stat_summary(fun = "median", aes(y = alive_mean, x = 1), geom = "point", color = "red")+
   annotate("text", label = "median", x = 1.5, y = 0.044, color = "red")+
-  scale_y_log10(labels = scales::percent)+
+  scale_y_continuous(labels = scales::percent)+
   coord_fixed(ratio=1, clip = "off")
 ```
 As displayed on the graph, the majority of the differences is smaller than 10%.
@@ -155,13 +166,7 @@ index = as.vector(createDataPartition(cov_mean$PATIENT_ID, p = 0.7, list = FALSE
 cov_train = cov_mean[index,] %>% as.data.frame()
 cov_test = cov_mean[-index,] %>% as.data.frame()
 
-# Optional: perform a -1 padding on the missing data. If this step is skipped, missing values will be assigned with knn Imputation for the glmnet model.
-
-cov_train <- cov_train %>% replace(is.na(.), -1)
-cov_test <- cov_test %>% replace(is.na(.), -1)
-
-head(cov_train)
-
+# missing values will be assigned with knn Imputation for the glmnet model. 
 
 ```
 
@@ -190,7 +195,7 @@ glmGrid = expand.grid(alpha = c(0,0.5,1),
 imp_pred = list()
 best_models = list()
 
-#run multiple times for reproducibility
+#run multiple times for reproducibility (20)
 print(Sys.time())
 
 for (i in 1:20){
@@ -205,7 +210,7 @@ glmfit = train( outcome ~.,
                 metric = "ROC",
                 trControl =fitControl,
                 tuneGrid = glmGrid,
-                preProcess = c("knnImpute","center","scale"),
+                preProcess = c("knnImpute", "center","scale"),
                 standardize = TRUE,
                 na.action = na.pass
                 )
@@ -249,14 +254,6 @@ print(plot_inf)
 
 
 ```
-```{r export images}
-# To export the graph of the relative influence of the predictors
-
-png(file = "glmnet.png", res = 300, width = 1024, height = 1024)
-plot_inf
-dev.off()
-
-```
 
 Perform predictions on the test data 
 ```{r validate glmnet model on test data}
@@ -264,7 +261,7 @@ Perform predictions on the test data
 # the model includes knn imputation, NA values can be passed to the function
 
 glmnet_pred = predict(glmfit, cov_test, na.action = na.pass)
-confusionMatrix(glmnet_pred, cov_test$outcome)
+confusionMatrix(glmnet_pred, cov_test$outcome, positive = "dead")
 
 ```
 
@@ -281,6 +278,7 @@ top_10_param <- do.call(rbind, imp_pred) %>%  group_by(var) %>%
                               summarise(rel_inf = mean(rel.inf)) %>% 
                               top_n(10) %>% arrange(-rel_inf)
 
+
 nfeature = 1
 best_depth = list()
 
@@ -290,12 +288,15 @@ for (nfeature in 1:4){
   
   selected = c("outcome",top_10_param[1:nfeature,1]  %>% unlist() %>% as.character())
   cov_train_select <- cov_train[,selected]
+  
+  # bug in the glmnet, it requiers an additional column
   cov_train_select <- cov_train_select %>% mutate(ones = 1)
-  class(cov_train_select)
 
-      for (i in 1:20){
+  print(paste("number of features:",nfeature))
+  
+      for (i in 1:10){
         
-        print(paste("iteration",i))
+        print(paste("iteration:",i, "| number of features:",nfeature))
         print(Sys.time())
         set.seed(i)
       
@@ -305,8 +306,8 @@ for (nfeature in 1:4){
                       metric = "ROC",
                       trControl =fitControl,
                       tuneGrid = glmGrid,
-                      #preProcess = c("knnImpute","center","scale"),
-                      #standardize = TRUE,
+                      preProcess = c("knnImpute","center","scale"),
+                      standardize = TRUE,
                       na.action = na.pass
                       )
         
@@ -333,9 +334,12 @@ best_d %>%  ggplot(aes(x = 1:nfeature, y = ROC)) +
                 labs(x = "number of parameters", y = "ROC")
 
 
+# select automatically an optimal number of features
 best_d <- best_d %>% mutate(improvement = ROC - lag(ROC))
-
 best_depth_val = which.max(best_d$improvement)
+
+# or select manually
+best_depth_val = 3
 
 
 ```
@@ -404,7 +408,6 @@ cov_data_lastday = cov_data_all %>% arrange(PATIENT_ID,RE_DATE) %>%
             labs(x = "hs-CRP (mg/L)", y = "LDH (U/L)", color = "outcome")
 ```
 The graph above displays the evolution the 2 best parameters for each patients, with the dot representing the last available value. Apart for 2 patients, if the values of Lactate dehydrogenase and hsCRP are below 342 U/L and 42 mg/L respectively, the outcome was favorable. This suggest that this model could be useful to predict the clinical outcome well before the death or discharge.
-  
 
 ```{r selecte all data with the selected parameters except the one corresponding to the last date}
 # exclude observations of the last date for each patient
@@ -412,10 +415,8 @@ cov_data_firstday = cov_data_all %>% anti_join(cov_data_lastday, by = c("PATIENT
 
 
 pred_date = predict(rpart_model, cov_data_firstday, type = "raw" )
-pred_matrix_test <- confusionMatrix(pred_date, cov_data_firstday$outcome)
+pred_matrix_test <- confusionMatrix(pred_date, cov_data_firstday$outcome, positive = "dead")
 pred_matrix_test
-
-print(paste("Accuracy on test data from other days:",pred_matrix_test$overall[1]))
 
 
 ```
@@ -459,6 +460,7 @@ cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
 ```
 The incorrect predictions (in red) appear to be scattered.
 
+
 ```{r}
 cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
                     geom_point(aes(color = as.factor(outcome), shape = as.factor(result)), alpha = 0.7)+
@@ -480,15 +482,20 @@ library(plotly)
 
 fig3d <- plot_ly(data = cov_data_firstday, x = ~Lactate.dehydrogenase, y = ~Hypersensitive.c.reactive.protein, z = ~X...lymphocyte, color = ~outcome, colors = c('#F8776D', '#00BFC4'), opacity = 0.6, size = 0.3) 
 
-
-fig3d <- fig3d %>% add_markers()
+fig3d <- fig3d %>% layout(
+    title = "Selected features",
+    scene = list(
+      xaxis = list(title = "Lactate dehydrogenase (U/L)"),
+      yaxis = list(title = "hs-CRP (mg/L)"),
+      zaxis = list(title = "Lymphocytes (%)")
+    ))
 
 fig3d
 
 
 ```
 
-The interpretable model can now be tested on an independent dataset from 110 patients for every available dates.
+The interpretable model can now be tested on an independent data set from 110 patients for every available dates.
 
 ```{r}
 
@@ -522,7 +529,7 @@ cov_new_all =   cov_new  %>%
 cov_new_all$outcome =  as.factor(cov_new_all$outcome)
 
 pred_date = predict(rpart_model, cov_new_all, type = "raw" )
-pred_matrix_test <- confusionMatrix(pred_date, cov_new_all$outcome)
+pred_matrix_test <- confusionMatrix(pred_date, cov_new_all$outcome, positive = "dead")
 pred_matrix_test
 
 print(paste("Accuracy on test data from other days:",pred_matrix_test$overall[1]))
@@ -567,4 +574,29 @@ cov_new_lastday = cov_new_all %>% arrange(PATIENT_ID,RE_DATE) %>%
 ```
 
 The graph above displays the evolution the 2 best parameters for each patients, with the dot representing the last available value. On this new dataset, if the values of Lactate dehydrogenase and hsCRP are below 342 U/L and 42 mg/L respectively, the outcome was favorable. 
+
+
+
+```{r}
+
+# plotlyr
+
+#install.packages("plotly")
+library(plotly)
+
+fig3d_test <- plot_ly(data = cov_new_all, x = ~Lactate.dehydrogenase, y = ~Hypersensitive.c.reactive.protein, z = ~X...lymphocyte, color = ~outcome, colors = c('#F8776D', '#00BFC4'), opacity = 0.6, size = 0.3) 
+
+fig3d_test <- fig3d_test %>% layout(
+    title = "External dataset",
+    scene = list(
+      xaxis = list(title = "Lactate dehydrogenase (U/L)"),
+      yaxis = list(title = "hs-CRP (mg/L)"),
+      zaxis = list(title = "Lymphocytes (%)")
+    ))
+
+fig3d_test
+
+
+```
+
   
