@@ -1,23 +1,21 @@
 ---
 title: "Covid-19 outcome prediction"
 output:
-  pdf_document: default
   html_notebook: default
+  pdf_document: default
 ---
 
 This work is based on the data and Analysis of Li-Yan et al., 2019 published in Nature Machine Intelligence. 
 https://www.nature.com/articles/s42256-020-0180-7#MOESM3
 
-Blood analysis data from 485 patients infected by COVID-19 were collected, after the exclusion of pregnant women, brest-feeding woman, patient younger than 18 yo and patients for whom more than 20% of the data were missing. In the end,the data are divided in two sets: 375 individual in the first set (training set) and 110 in the second set (testing set). For each patient, up to 78 parameters were measured at several occasion between the admission and the release/death. 
+Blood analysis data from 485 patients infected by COVID-19 were collected, after the exclusion of pregnant women, breast-feeding woman, patient younger than 18 yo and patients for whom more than 20% of the data were missing. In the end,the data are divided in two sets: 375 individual in the first set (training set) and 110 in the second set (testing set). For each patient, up to 78 parameters were measured at several occasion between the admission and the release/death. 
 
 Here we use the rapid glmnet method to produce a classification model based the last data point available for each parameter. We reasoned that using the last data point would be more predictive of the outcome. 
 
 Based on the results of the glmnet model, 3 features selected to build an interpretable decision tree.
 
-```{r Blank Slate}
-# blank slate, load required libraries and set working directory
-
-#rm(list=ls())
+```{r load packages}
+# load required libraries and set working directory
 
 library(knitr)
 
@@ -27,15 +25,12 @@ library(RANN) # for knn imputation
 
 library(dplyr) 
 library(tidyr)
+library(ggplot2)
 library(ggfortify) # enable auto plotting
 library(rpart) # decision tree model
 library(rattle) # plotting decision tree
 library(glmnet) # glm model fitting
 
-
-
-setwd("~/Desktop")
-list.files()
 ```
 
 
@@ -43,7 +38,6 @@ The identification of the patient (PATIENT_ID) is only displayed for the first r
 ```{r data loading}
 #load data, perform clean-up
 #propagate patient ID to all corresponding observations
-
 
 cov_data = read.csv("time_series_375_prerpocess_en.csv",head= TRUE)
 cov_data$RE_DATE = as.Date(cov_data$RE_DATE)
@@ -58,8 +52,7 @@ for (i in 1:length(cov_data$PATIENT_ID)) {
   
 }
 
-dim(cov_data) 
-length(unique(cov_data$PATIENT_ID)) # nombre de patients
+print(paste("number of patient: ", length(unique(cov_data$PATIENT_ID)))) # number of patients
 head(cov_data)
 
 ```
@@ -68,8 +61,8 @@ A maximum of 81 parameters were collected for 375 patients
 ```{r data cleaning}
 # select the LAST (most recent) available value of each parameter for each patient. The date of analysis is eliminated since the last value of different variable may have been taken at different dates (not every parameters are measured every day).
 # eliminate parameters for which the value is unknown for more than 20% of patients
-# turn the outcome in dead/alive instead of 1/0
-# don't drop_na hare because NA might be contained in variables which have an influence later
+# turn the outcome into dead/alive instead of 1/0
+# don't drop all columns containing NA values
 
 time_col = c("RE_DATE","Admission.time","Discharge.time")
 
@@ -81,7 +74,25 @@ cov_mean <- cov_data %>%  group_by(PATIENT_ID) %>%
                           mutate(outcome = as.factor(ifelse(outcome == 1, "dead", "alive"))) 
 
 head(cov_mean)
-dim(cov_mean)
+
+print(paste("number of variables:", ncol(cov_mean)))
+
+cov_mean_long = cov_mean[,-1] %>% pivot_longer(cols = colnames(cov_mean[,-1])[-3], names_to = "variables", values_to = "val")
+
+cov_mean_long %>% head()
+
+
+# create a boxplot for each variable in function of the outcome. The plot, generally to bit too large to be presented directly, is saved as a png.
+multiplot = cov_mean_long %>% ggplot(aes(x = outcome, y = val, color = outcome)) +
+                              geom_boxplot()+
+                              facet_wrap(. ~ variables, ncol = 5, scales='free')+
+                              labs(x = "outcome", y = "value")+
+                              theme_classic()+
+                              theme(legend.position = "none")
+
+png("multiplot.png", res = 300, height = 10000, width = 5000)
+multiplot
+dev.off()
 
 ```
 ```{r PCA representation}
@@ -112,7 +123,10 @@ prcom_NA = function(x,y){
 
 } 
 
+
 cov_mean %>% select(-PATIENT_ID) %>% prcom_NA("outcome")
+
+
 ```
 
 
@@ -129,33 +143,55 @@ gg_miss_case(cov_mean)
 # Are the samples with missing value very different from the rest ?
 # calculate the relative difference for each parameters between the data with and without missing values
 
-missing_cov_mean <- cov_mean %>% 
-                    mutate(outcome = ifelse(outcome == "dead",1,0)) %>%
-                    group_by(outcome) %>%
-                    filter_all(any_vars(is.na(.))) %>% 
-                    summarize_all(~ mean(., na.rm = TRUE))
+rel_diff <- cov_mean %>% bind_shadow(only_miss = TRUE) %>% 
+            add_label_shadow() %>%
+            group_by(any_missing) %>%
+            select(!contains("_NA")) %>%
+            mutate(outcome = ifelse(outcome == "alive",0,1)) %>%
+            summarize_all(~ mean(., na.rm = TRUE)) %>%
+            ungroup() %>%
+            pivot_longer(-any_of("any_missing"), names_to = "variables", values_to = "val") 
 
-all_cov_mean <- cov_mean %>% 
-                    mutate(outcome = ifelse(outcome == "dead",1,0)) %>%
-                    group_by(outcome) %>%
-                    summarize_all(~ mean(., na.rm = TRUE))
 
-rel_diff <- (missing_cov_mean-all_cov_mean)/all_cov_mean %>% as.data.frame() 
-as_tibble(cbind(param = names(rel_diff[,-1]), (t(rel_diff[,-1])))) %>% mutate( dead_mean = as.numeric(V2), alive_mean = as.numeric(V3)) %>%
-  ggplot()+
-  geom_point(alpha = 0.5, aes(x = "dead",y = dead_mean))+
-  geom_point(alpha = 0.5, aes(x = "alive",y = alive_mean))+
-  ylab("relative difference NA/not NA")+
-  xlab("parameters")+
-  theme_classic()+
-  stat_summary(fun = "median", aes(y = dead_mean, x = 2), geom = "point", color = "red")+
-  stat_summary(fun = "median", aes(y = alive_mean, x = 1), geom = "point", color = "red")+
-  annotate("text", label = "median", x = 1.5, y = 0.044, color = "red")+
-  scale_y_continuous(labels = scales::percent)+
-  coord_fixed(ratio=1, clip = "off")
+rel_diff %>%  ggplot(aes(x = any_missing, y = log2(val), group = variables)) + 
+              geom_line() + geom_point() + 
+              theme_classic() + 
+              labs(x = "")
+
+library(ggrepel)
+
+
+# for a histogram and density display of the relative difference between samples with missing variables and samples with no missing variables.
+rel_diff %>%  pivot_wider(names_from = any_missing, values_from = val) %>% 
+              dplyr::rename("Not_Missing"="Not Missing") %>%
+              mutate(diff = (Missing-Not_Missing)/Missing) %>%
+              filter(variables != "PATIENT_ID") %>%
+              ggplot(aes(x = diff))+
+              geom_histogram(fill = "lightgray", color = "white", bins = 50)+
+              geom_density()+
+              labs(x = "relative difference")+
+              theme_minimal()
+
+
+# for a violin and point display of the relative difference between samples with missing variables and samples with no missing variables.
+rel_diff %>%  pivot_wider(names_from = any_missing, values_from = val) %>% 
+              dplyr::rename("Not_Missing"="Not Missing") %>%
+              mutate(diff = (Missing-Not_Missing)/Missing) %>%
+              filter(variables != "PATIENT_ID") %>%
+              ggplot(aes(x = "diff", y = diff))+
+              geom_violin()+
+              geom_point()+
+              geom_text_repel(aes(label = ifelse(abs(diff) > 0.3, variables,"")), min.segment.length = 0, nudge_x = 0.2)+
+              labs(x = " ", y = "relative difference sample w/o NA / samples with NA")+
+              theme_classic()
+
+
+
 ```
-As displayed on the graph, the majority of the differences is smaller than 10%.
-Since the samples are not fundamentally different, one can try to perform a knn or median input.
+As displayed on the graph, for the majority of the variables the differences between the samples where all variables are present and the samples where some are missing are smaller than 20%, suggesting that these samples are not fundamentally different. One can try to perform a knn or median imputation for the missing values.
+
+One should however be careful if the model includes the concentration of procalicitonin, or the count of red blood cells or white blood cells.
+
 
 ```{r train and test samples preparation}
 
@@ -166,7 +202,7 @@ index = as.vector(createDataPartition(cov_mean$PATIENT_ID, p = 0.7, list = FALSE
 cov_train = cov_mean[index,] %>% as.data.frame()
 cov_test = cov_mean[-index,] %>% as.data.frame()
 
-# missing values will be assigned with knn Imputation for the glmnet model. 
+# missing values will be assigned with knn Imputation in the glmnet model. 
 
 ```
 
@@ -194,6 +230,7 @@ glmGrid = expand.grid(alpha = c(0,0.5,1),
 
 imp_pred = list()
 best_models = list()
+glmfit_list = list()
 
 #run multiple times for reproducibility (20)
 print(Sys.time())
@@ -217,6 +254,7 @@ glmfit = train( outcome ~.,
   
   imp_pred[[i]] = data.frame(var = rownames(varImp(glmfit)$importance), rel.inf = varImp(glmfit)$importance$Overall)
   best_models[[i]] = cbind(glmfit$bestTune,max(glmfit$results$ROC))
+  glmfit_list[[i]] = glmfit
   
   print(paste("max accuracy", max(glmfit$results$ROC)))
 
@@ -231,65 +269,97 @@ Display and select the most influential parameters
 ```{r display influential parameters}
 # save the best hyper-parameters
 best_a_l =  do.call(rbind, best_models) %>% 
-              summarise(alpha = median(alpha), lambda = median(lambda)) %>% 
+              summarise_all(~median(.)) %>% 
               unlist()
 
 head(best_a_l)
 
-print(best_models)
-
 # select the most influential factors
-plot_inf <- do.call(rbind, imp_pred) %>%  group_by(var) %>% 
-                              summarise(rel_inf = mean(rel.inf)) %>% 
-                              top_n(10) %>%
-                              ggplot(aes(x = reorder(var,rel_inf), y = rel_inf))+
-                              geom_col(fill = "#00BFC4", alpha = 0.2)+
-                              labs(y = "relative influence", x = "parameters", title = "glmnet")+
-                              coord_flip()+
+# plot_inf <- do.call(rbind, imp_pred) %>%  group_by(var) %>% 
+#                               summarise(rel_inf = mean(rel.inf)) %>% 
+#                               top_n(10) %>%
+#                               ggplot(aes(x = reorder(var,rel_inf), y = rel_inf))+
+#                               geom_col(fill = "#00BFC4", alpha = 0.2)+
+#                               labs(y = "relative influence", x = "parameters", title = "glmnet")+
+#                               coord_flip()+
+#                               theme_classic()
+# 
+# 
+# print(plot_inf)
+
+# display graph of the most influential parameters 
+library(purrr)
+do.call(rbind, imp_pred) %>%  as_tibble %>%
+                              group_by(var) %>% 
+                              nest() %>%
+                              mutate(score = map_dbl(data, ~mean(.x$rel.inf))) %>%
+                              mutate(sd = map_dbl(data, ~sd(.x$rel.inf))) %>%
+                              select(-data) %>%
+                              arrange(desc(score)) %>%
+                              ungroup() %>%
+                              slice(1:10) %>%
+                              ggplot(aes(x = reorder(var,score), y = score)) + 
+                              geom_point(fill = "#00BFC4", alpha = 0.2) +
+                              coord_flip() +
+                              labs(x = "parameter", y = "relative influence ± SD")+
+                              geom_errorbar(aes(ymin = score-sd, ymax = score+sd), size = 0.1, width = 0.3)+
                               theme_classic()
-
-print(plot_inf)
-
-
 
 
 ```
+
+
 
 Perform predictions on the test data 
 ```{r validate glmnet model on test data}
 
-# the model includes knn imputation, NA values can be passed to the function
+glmnet_pred_cm = list()
 
-glmnet_pred = predict(glmfit, cov_test, na.action = na.pass)
-confusionMatrix(glmnet_pred, cov_test$outcome, positive = "dead")
+# Predict outcome with the best model of each iteration on test data
+# The Models include knn imputation, NA values can be passed to the function
+
+for(i in 1:20){
+
+glmnet_pred = predict(glmfit_list[[i]], cov_test, na.action = na.pass)
+glmnet_pred_cm[[i]] <- confusionMatrix(glmnet_pred, cov_test$outcome, positive = "dead")
+
+}
+
+# Display the average of the evaluation metrics
+lapply(glmnet_pred_cm, "[[", "byClass") %>% do.call(rbind, .) %>% as_tibble %>% summarize_all(~mean(.))
+
 
 ```
+mean metrics of predictions performed with the best model of each iteration on test data.
+
 
 
 ```{r features selection}
 
-
 # select the optimal number of parameters acceptable for the decision tree model.
-glmGrid = expand.grid(alpha = c(0,0.5,1),
+glmGrid = expand.grid(alpha = c(0, 0.5, 1),
                       lambda = seq(0.0001,0.1,length = 10))
 
 
+# list the most influential parameters
 top_10_param <- do.call(rbind, imp_pred) %>%  group_by(var) %>% 
                               summarise(rel_inf = mean(rel.inf)) %>% 
                               top_n(10) %>% arrange(-rel_inf)
 
-
 nfeature = 1
 best_depth = list()
 
-for (nfeature in 1:4){
+for (nfeature in 1:5){
   
   best_models_min =list()
   
+  # select parameters
   selected = c("outcome",top_10_param[1:nfeature,1]  %>% unlist() %>% as.character())
+  
+  # select values of the corresponding parameters
   cov_train_select <- cov_train[,selected]
   
-  # bug in the glmnet, it requiers an additional column
+  # known bug in the glmnet, it requires at least two columns of independent variables, add a column with constant value
   cov_train_select <- cov_train_select %>% mutate(ones = 1)
 
   print(paste("number of features:",nfeature))
@@ -338,7 +408,7 @@ best_d %>%  ggplot(aes(x = 1:nfeature, y = ROC)) +
 best_d <- best_d %>% mutate(improvement = ROC - lag(ROC))
 best_depth_val = which.max(best_d$improvement)
 
-# or select manually
+# or select manually the best balance between complexity and ROC, e.g.
 best_depth_val = 3
 
 
@@ -348,8 +418,8 @@ best_depth_val = 3
 
 ```{r simple decision tree on the most influential parameters (rtree_model)}
 
-#collect the same number of top parameters as the optimal interaction depth and the associated outcome
-
+# The optimal number of parameters has been selected
+# Build a decision tree model based on these parameters
 
 best_param <- plot_inf$data %>% arrange(desc(rel_inf)) %>%
               top_n(best_depth_val) %>%
@@ -393,12 +463,12 @@ cov_data_all$outcome = as.factor(cov_data_all$outcome)
 
 
 # select observations of last date available for each patient
-# plot patient trajectories with dot representing the last measure
 cov_data_lastday = cov_data_all %>% arrange(PATIENT_ID,RE_DATE) %>% 
                                     group_by(PATIENT_ID) %>%
                                     filter(RE_DATE == max(RE_DATE))
 
-            ggplot(cov_data_all, aes_string(x = best_param[2], y = best_param[1], group = "PATIENT_ID"))+
+# plot patient trajectories as a line with dot representing the last measure
+ggplot(cov_data_all, aes_string(x = best_param[1], y = best_param[2], group = "PATIENT_ID"))+
             geom_line(aes(color = as.factor(outcome)), alpha = 0.2)+
             theme_classic()+
             geom_hline(yintercept = split1, lty = 3, size = 0.5)+
@@ -446,7 +516,10 @@ cov_data_firstday %>% group_by(time_to_outcome) %>%
 Starting 2 weeks before the outcome, the accuracy of the predictions made on the data from the 375 patients dataset gradually increases. (Since the the last data acquired before the outcome were used for the training, they were excluded from the testing set presented here and there is therefor no data available for testing the prediction on the day of the outcome)
 
 ```{r display prediction from (rtree_model)}
-cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
+
+
+
+cov_data_firstday %>% ggplot(aes_string(x = best_param[1], y = best_param[2]))+
                     geom_point(aes(color = as.factor(result), shape = as.factor(outcome)), alpha = 0.7)+
                     geom_rug(aes(color = as.factor(result)), size = 0.2, alpha = 0.7)+
                     theme_classic()+
@@ -454,6 +527,7 @@ cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
                     geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
                     labs(color = "correct prediction")+
                     labs(shape = "outcome")+
+                    labs(x = "hs-CRP (mg/L)", y = "LDH (U/L)")+
                     annotate("text", x = 250, y = 1500, label = paste("Accuracy all data except \n last day =",as.character(round(pred_matrix_test$overall[1],2))))
 
 
@@ -462,7 +536,7 @@ The incorrect predictions (in red) appear to be scattered.
 
 
 ```{r}
-cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
+cov_data_firstday %>% ggplot(aes_string(x = best_param[1], y = best_param[2]))+
                     geom_point(aes(color = as.factor(outcome), shape = as.factor(result)), alpha = 0.7)+
                     geom_rug(aes(color = as.factor(outcome)), size = 0.2, alpha = 0.7)+
                     theme_classic()+
@@ -470,6 +544,7 @@ cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
                     geom_segment(y = 0, yend = split1, x = split2, xend = split2,lty = 3, size = 0.5)+
                     labs(color = "outcome")+
                     labs(shape = "correct prediction")+
+                    labs(x = "hs-CRP (mg/L)", y = "LDH (U/L)")+
                     annotate("text", x = 250, y = 1500, label = paste("Accuracy all data except \n last day =",as.character(round(pred_matrix_test$overall[1],2))))
 ```
 
@@ -479,6 +554,8 @@ cov_data_firstday %>% ggplot(aes_string(y = best_param[1], x = best_param[2]))+
 
 #install.packages("plotly")
 library(plotly)
+
+# 3D representation of the outcome of the patients from the training dataset in function of the selected parameters
 
 fig3d <- plot_ly(data = cov_data_firstday, x = ~Lactate.dehydrogenase, y = ~Hypersensitive.c.reactive.protein, z = ~X...lymphocyte, color = ~outcome, colors = c('#F8776D', '#00BFC4'), opacity = 0.6, size = 0.3) 
 
@@ -535,7 +612,6 @@ pred_matrix_test
 print(paste("Accuracy on test data from other days:",pred_matrix_test$overall[1]))
 
 #inject predictions in the tibble
-
 cov_new_all$pred = pred_date
 
 cov_new_all = cov_new_all %>% mutate(result = (outcome == pred))
@@ -558,11 +634,13 @@ cov_new_all %>%   filter(time_to_outcome >= 0) %>%
 The model predicts with an overall 91 % accuracy the clinical outcome on an external data set.
 
 ```{r}
+
+# plot patient trajectories form the external test dataset as a line with dot representing the last available measure
 cov_new_lastday = cov_new_all %>% arrange(PATIENT_ID,RE_DATE) %>% 
                                     group_by(PATIENT_ID) %>%
                                     filter(RE_DATE == max(RE_DATE))
 
-            ggplot(cov_new_all, aes_string(x = best_param[2], y = best_param[1], group = "PATIENT_ID"))+
+            ggplot(cov_new_all, aes_string(x = best_param[1], y = best_param[2], group = "PATIENT_ID"))+
             geom_line(aes(color = as.factor(outcome)), alpha = 0.2)+
             theme_classic()+
             geom_hline(yintercept = split1, lty = 3, size = 0.5)+
@@ -578,11 +656,7 @@ The graph above displays the evolution the 2 best parameters for each patients, 
 
 
 ```{r}
-
-# plotlyr
-
-#install.packages("plotly")
-library(plotly)
+# 3D representation of the outcome of the patients from the external test dataset in function of the selected parameters
 
 fig3d_test <- plot_ly(data = cov_new_all, x = ~Lactate.dehydrogenase, y = ~Hypersensitive.c.reactive.protein, z = ~X...lymphocyte, color = ~outcome, colors = c('#F8776D', '#00BFC4'), opacity = 0.6, size = 0.3) 
 
